@@ -1,0 +1,619 @@
+/*
+Author      : MST
+Test Class : 
+Description: This batch class will  to archive the Email Message for the closed cases
+*/
+global class EmailMessageArchiveBatch_AC implements  Database.Batchable<SObject>, Database.Stateful,Schedulable {
+    Map<Id,String> errMsgMap = new Map<Id, String>();
+    
+    public static Group groupDetail;
+    
+    public  List<WrapperEMailAttach> EmailMessageswrap  {get; set;}
+    
+    public List<WrapperChatterFeeds> feedWrapper {get; set;}
+    
+    global Database.QueryLocator start(Database.BatchableContext bc) {   
+        groupDetail = [SELECT Id, Name, DeveloperName, Email, Type FROM Group where Type='Queue' And Name ='Junk' limit 1];
+        string query = System.Label.CaseArchiveBaseQuery ; 
+            //+AND ownerId !=\''+ groupDetail.Id+'\'';            
+        //SELECT Id,Subject,Origin,SuppliedEmail,Status,Secure__c,ParentId,ownerId,CaseNumber FROM Case WHERE IsClosed = true and ClosedDate = today and Archived__c  = false and Origin like 'Email%'
+        system.debug('query '+ query);
+        return Database.getQueryLocator(query);     
+    }
+    
+    global void execute(Database.BatchableContext bc, List<SObject> listCases){
+        system.debug('No of records '+ listCases.size());
+        Set<Id> insertedPDFId = new Set<Id>();
+        List<Id> insertedContentVersionId = new List<Id>();
+        List<case> lstOfqueriedCases =(List<Case>) listCases;
+        Savepoint sp = Database.setSavepoint();
+        Set<Id> setInsertedContDocIds = createAttachmentOnCase(lstOfqueriedCases,sp); 
+        getEmailMessages(lstOfqueriedCases);
+        getFeedChatter(lstOfqueriedCases);
+        List<ContentVersion> lstContentRec =  new List<ContentVersion>();
+        
+        for (Case caseRecord :lstOfqueriedCases){
+            // created page reference
+            PageReference pdf = Page.EmailMessageFeedPDFGeneratorTemplate;
+            system.debug('case ID : '+ caseRecord.Id);
+            pdf.getParameters().put('id', caseRecord.Id);
+            pdf.getParameters().put('generatepdf','true');    
+            ContentVersion contentRecord = new ContentVersion();        
+            contentRecord.Title = caseRecord.caseNumber +' Email Messages Archive.pdf';        
+            contentRecord.PathOnClient = caseRecord.caseNumber +' Email Messages Archive.pdf';
+            if(Test.isRunningTest()) { 
+                contentRecord.VersionData = blob.valueOf('Unit.Test');
+            }
+            else{
+                try{
+                    contentRecord.VersionData = pdf.getContent();  
+                }
+                Catch (Exception ex){
+                    errMsgMap.put(caseRecord.Id, ex.getMessage());
+                    database.rollback(sp);
+                    system.debug('Error on inserting PDF content: '+ex.getMessage());
+                }   
+            }
+            contentRecord.IsMajorVersion = true;        
+            lstContentRec.add(contentRecord);
+        }
+        if(lstContentRec.size() > 0){     
+             Database.SaveResult[] drList;
+            try{
+            drList = Database.insert(lstContentRec, false);
+            }
+             Catch (Exception ex){
+                    errMsgMap.put(lstContentRec[0].Id, ex.getMessage());
+                    database.rollback(sp);
+                    system.debug('Error on inserting PDF content: '+ex.getMessage());
+                }  
+            List<String> appDebugLogList = new List<String>();              
+            for(Database.SaveResult dr : drList) {
+                if (dr.isSuccess()) {                       
+                    System.debug('Successfully Inserted ContentVersion with ID: ' + dr.getId());
+                    insertedContentVersionId.add(dr.getId());
+                }
+                else{      
+                    System.debug('The following error has occurred.');  
+                    for(Database.Error err : dr.getErrors()) {                                               
+                        System.debug(err.getStatusCode() + ': ' + err.getMessage());
+                        appDebugLogList.add('Error Message Inserted ContentVersion:'+err.getMessage()+'err.getStatusCode() '+ err.getStatusCode()  );
+                    }
+                }
+            }
+        }
+        //Get Content Documents
+        Map<Id,ContentVersion> mapContVerContDoc = new Map<Id,ContentVersion>();
+        
+        for(ContentVersion conDocId : [SELECT Id,ContentDocumentId,ContentDocument.Title FROM ContentVersion WHERE Id IN :lstContentRec]){
+            mapContVerContDoc.put(conDocId.Id, conDocId);
+        }
+        
+        //Create ContentDocumentLink
+        Map<Id,List<ContentDocumentLink>> lstContDocuLink = new Map<Id,List<ContentDocumentLink>>();
+        for (Case caseRecord :lstOfqueriedCases){
+            for(ContentVersion conVer:mapContVerContDoc.values()){
+                // associate the created PDF with case record by validating the PDF name starts with respective casenumber
+                if(conVer.ContentDocument.Title.Startswith(caseRecord.CaseNumber)){
+                    ContentDocumentLink contentDocLink = New ContentDocumentLink();        
+                    contentDocLink.LinkedEntityId =  caseRecord.Id;        
+                    contentDocLink.ContentDocumentId = conVer.ContentDocumentId;        
+                    contentDocLink.shareType = 'V';        
+                    //lstContDocuLink.add(contentDocLink);  
+                    List<Id> lstmems = new List<Id>();
+                    if(lstContDocuLink.containsKey(conVer.ContentDocumentId)){               
+                        lstmems.add(conVer.ContentDocumentId);                                                      
+                        lstContDocuLink.get(conVer.ContentDocumentId).add(contentDocLink);
+                    }
+                    else{                                                                     
+                        lstContDocuLink.put(conVer.ContentDocumentId, new List<ContentDocumentLink>{contentDocLink});
+                    }
+                }
+            }
+        }   
+        if(lstContDocuLink.size() > 0){
+            List<ContentDocumentLink> contentDocLink = new List<ContentDocumentLink>();
+            for(List<ContentDocumentLink> wrapper: lstContDocuLink.values()) {
+                contentDocLink.addAll(wrapper);
+            }
+            //Insert lstContDocuLink;
+            
+            // contentDocLink =(List<ContentDocumentLink>) lstContDocuLink.Values();
+            Database.SaveResult[] drListContDocu = Database.insert(contentDocLink, false);
+            List<String> appDebugLogList = new List<String>();              
+            
+            for (Integer i = 0; i < drListContDocu.size(); i++){
+                String failedError= '' ;
+                if(drListContDocu.get(i).isSuccess()){
+                    insertedPDFId.add(drListContDocu.get(i).getId());
+                    System.debug('Successfully Inserted PDF for case ID: ' + drListContDocu.get(i).getId());
+                }
+                else  if(!drListContDocu.get(i).isSuccess()){
+                    for(Database.Error err : drListContDocu.get(i).getErrors()) {                                              
+                        System.debug(err.getStatusCode() + ': ' + err.getMessage());
+                        failedError +=' '+ err.getMessage();                                               
+                    }
+                    appDebugLogList.add('Error Message Inserted PDF: '+failedError);
+                    errMsgMap.put(contentDocLink.get(i).LinkedEntityId, failedError);
+                    database.rollback(sp);
+                }
+            } 
+        }
+        set<Id> lstUpdatedCase = new set<Id>();
+        Map<Id,Case> mapIdCases = new Map<Id,Case>();
+        // Set<Id> setInsertedContDocIds = createAttachmentOnCase(lstOfqueriedCases,sp);        
+        lstUpdatedCase = updateCase(insertedPDFId,sp);        
+        mapIdCases = checkPDFGeneratedForCases(lstUpdatedCase);        
+        deleteEmailMessage(mapIdCases.values(),sp);	
+        createCaseComments(lstUpdatedCase,insertedPDFId,sp,insertedContentVersionId);
+    }
+    
+    
+    global void finish(Database.BatchableContext bc){
+        // Get the AsyncApexJob that represents the Batch job using the Id from the BatchableContext
+        AsyncApexJob a = [Select Id, Status, NumberOfErrors, JobItemsProcessed,
+                          TotalJobItems, CreatedBy.Email, ExtendedStatus
+                          from AsyncApexJob where Id = :BC.getJobId()];
+        String emailBody = 'The Case Archive batch Apex job completed. Below are the details: \n\n Number of Cases processed: ' + a.TotalJobItems + '\n Number of Cases Archived: '+  (a.TotalJobItems-a.NumberOfErrors) +'\n Number of Cases failed: '+ a.NumberOfErrors;
+        
+        // Email the Batch Job's submitter that the Job is finished.
+        // Define email file attachment list
+        Messaging.EmailFileAttachment[] emailAttList = new List<Messaging.EmailFileAttachment>();
+        if(!errMsgMap.isEmpty()){
+            // Creating the CSV file for error
+            String finalstr = 'Id, Error \n';               
+            String attName = 'Case_Archive_Errors_' + system.now().format('MM-dd-YYYY') + '.csv';
+            for(Id id  : errMsgMap.keySet()){
+                string err = errMsgMap.get(id);
+                // Case acct = (Case) IdToSObjectMap.get(id);                    
+                string recordString = '"'+id+'","'+err+'"\n';
+                finalstr = finalstr +recordString;
+            }
+            
+            // Create the email attachment    
+            Messaging.EmailFileAttachment efa = new Messaging.EmailFileAttachment();
+            efa.setFileName(attName);
+            efa.setBody(Blob.valueOf(finalstr));
+            emailAttList.add(efa);
+            emailBody = 'The Case Archive batch Apex job completed. Below are the details: \n\n Number of Cases processed: ' + a.TotalJobItems + '\n Number of Cases Archived: '+  (a.TotalJobItems-a.NumberOfErrors) +'\n Number of Cases failed: '+ a.NumberOfErrors+'\n\n Please find the attachment for the error details'; 
+        }
+        
+        Messaging.SingleEmailMessage mail = new Messaging.SingleEmailMessage();
+        String[] toAddresses = new String[] {a.CreatedBy.Email};
+            mail.setToAddresses(toAddresses);
+        mail.setSubject('[' +system.now().format('MM-dd-YYYY')+'] Case Archive Batch Job Status : ' + a.Status);
+        mail.setFileAttachments(emailAttList);            
+        mail.setPlainTextBody(emailBody);
+        
+        Messaging.SendEmailResult [] r =  Messaging.sendEmail(new Messaging.SingleEmailMessage[] {mail});
+        
+    }    
+    
+    public class WrapperEMailAttach{
+        public EmailMessage emailMessage {get; set;}
+        // public String Attachmentname {get; set;}
+        public List<ContentDocument> Attachmentname {get; set;}
+        public String CaseNumber {get; set;} 
+        //Constructor method 
+        public WrapperEMailAttach(EmailMessage email,List<ContentDocument> Attachment, String caseNum) {
+            emailMessage = email;
+            Attachmentname = Attachment;
+            CaseNumber = caseNum;
+        }
+    }
+    
+    public class WrapperChatterFeeds{
+        public FeedItem feed {get; set;}
+        public List<FeedComment> feedCommentsList {get; set;}
+        public string caseCommentBody  {get; set;}
+        //Constructor method 
+        public WrapperChatterFeeds(FeedItem fItem,List<FeedComment> feedCommentsLst,string body) {
+            feed = fItem;
+            feedCommentsList = feedCommentsLst;      
+            caseCommentBody = body ;
+        }
+    }
+    
+    public void getEmailMessages(List<Case> lstOfqueriedCases){
+        Map<Id,List<EmailMessage>> mapCaseEmails = new Map<Id,List<EmailMessage>>();
+        for(EmailMessage EmailMessages : [SELECT ParentId,FromName,FromAddress,MessageDate,ToAddress,ccAddress,BccAddress,subject,HtmlBody,HasAttachment,RelatedToId
+                                          FROM EmailMessage WHERE RelatedToId IN:lstOfqueriedCases Order by MessageDate desc ] ){
+                                              List<Id> lstmems = new List<Id>();
+                                              if(mapCaseEmails.containsKey(EmailMessages.RelatedToId)){               
+                                                  lstmems.add(EmailMessages.RelatedToId);                                                      
+                                                  mapCaseEmails.get(EmailMessages.RelatedToId).add(EmailMessages);
+                                              }
+                                              else{                                                                     
+                                                  mapCaseEmails.put(EmailMessages.RelatedToId, new List<EmailMessage>{EmailMessages});
+                                              }
+                                          }
+        Set<Id> setContentDocumentIds = new Set<Id>();
+        Map<Id,List<Id>> mapEmailContentId = new Map<Id,List<Id>>();
+        Map<Id,ContentDocument> mapContentIdName = new Map<Id,ContentDocument>();
+        for(ContentDocumentLink contentDoc : [SELECT ContentDocumentId,LinkedEntityId FROM ContentDocumentLink WHERE LinkedEntityId IN 
+                                              (SELECT ID From EmailMessage WHERE ParentId IN:lstOfqueriedCases)]){
+                                                  setContentDocumentIds.add(contentDoc.ContentDocumentId);
+                                                  List<Id> lstmems = new List<Id>();
+                                                  if(mapEmailContentId.containsKey(contentDoc.LinkedEntityId)){               
+                                                      lstmems.add(contentDoc.LinkedEntityId);                                                      
+                                                      mapEmailContentId.get(contentDoc.LinkedEntityId).add(contentDoc.ContentDocumentId);
+                                                  }
+                                                  else{                                                                     
+                                                      mapEmailContentId.put(contentDoc.LinkedEntityId, new List<Id>{contentDoc.ContentDocumentId});
+                                                  }
+                                              }
+        for(ContentDocument documents: [Select Title, FileType,CreatedDate, ContentSize,Id,FileExtension from ContentDocument where Id IN: setContentDocumentIds]){
+            //mapContentIdName.put(documents.Id,documents.Title+'.'+documents.FileExtension);
+            mapContentIdName.put(documents.Id,documents);
+        }
+        system.debug('mapContentIdName '+ mapContentIdName);
+        // Map<Id,String> mapEmailAttachment = new Map<Id,String>();
+        Map<Id,List<ContentDocument>> mapEmailAttachment = new Map<Id,List<ContentDocument>>();
+        for (Case caseRecord :lstOfqueriedCases){
+            if(mapCaseEmails.containskey(caseRecord.Id)){
+                for(EmailMessage email: mapCaseEmails.get(caseRecord.Id)){
+                    String AttachmentName = '';
+                    if(mapEmailContentId.containskey(email.Id)){
+                        for(Id contentId :mapEmailContentId.get(email.Id)){
+                            if(mapContentIdName.containskey(contentId)){
+                                // AttachmentName += mapContentIdName.get(contentId) +'; ';
+                                // AttachmentName += '<a href=\'/'+ contentId +'\'>'+mapContentIdName.get(contentId)+'</a>;';
+                                List<Id> lstmems = new List<Id>();
+                                if(mapEmailAttachment.containsKey(email.Id)){               
+                                    lstmems.add(email.Id);                                                      
+                                    mapEmailAttachment.get(email.Id).add(mapContentIdName.get(contentId));
+                                }
+                                else{                                                                     
+                                    mapEmailAttachment.put(email.Id, new List<ContentDocument>{mapContentIdName.get(contentId)});
+                                }
+                            }
+                        }
+                    }
+                    //mapEmailAttachment.put(email.Id, AttachmentName);
+                }
+            }}
+        system.debug('mapEmailAttachment '+ mapEmailAttachment);        
+        if(EmailMessageswrap == null) {
+            EmailMessageswrap = new List<WrapperEMailAttach>();
+            
+        }
+        // find the duplicates in the new case records
+        for (Case caseRecord :lstOfqueriedCases){
+            if(mapCaseEmails.containskey(caseRecord.Id)){
+                for(EmailMessage test: mapCaseEmails.get(caseRecord.Id)) {
+                    if(mapEmailAttachment.containskey(test.Id)){
+                        EmailMessageswrap.add(new WrapperEMailAttach(test,mapEmailAttachment.get(test.Id),caseRecord.CaseNumber));
+                    }
+                }
+            }
+        }  
+    }
+    
+    public void getFeedChatter(List<Case> lstOfqueriedCases){
+        if(feedWrapper == null) {
+            feedWrapper = new List<WrapperChatterFeeds>();
+            Map<Id,List<String>> caseCommnentsBodyMap = new Map<Id,List<String>>();
+            for(CaseComment caseCom :[Select id,CommentBody,ParentId from CaseComment where ParentId IN: lstOfqueriedCases ORDER BY CreatedDate DESC]){
+                List<Id> lstmems = new List<Id>();
+                if(caseCommnentsBodyMap.containsKey(caseCom.ParentId)){               
+                    lstmems.add(caseCom.ParentId);                                                      
+                    caseCommnentsBodyMap.get(caseCom.ParentId).add(caseCom.CommentBody);
+                }
+                else{                                                                     
+                    caseCommnentsBodyMap.put(caseCom.ParentId, new List<String>{caseCom.CommentBody});
+                }
+            }
+            system.debug('caseCommnentsBodyMap '+ caseCommnentsBodyMap);
+            
+            Map<Id,List<FeedItem>> mapCaseIdFeeds = new Map<Id,List<FeedItem>>();                         
+            for(FeedItem caseFeedRec : [SELECT Body, InsertedBy.Name,CreatedDate, Type,ParentId, (SELECT CommentBody,CommentType,InsertedBy.Name,CreatedDate FROM FeedComments ORDER BY CreatedDate DESC) 
+                                        FROM FeedItem WHERE ParentId IN: lstOfqueriedCases AND (Type = 'TextPost' OR Type ='CaseCommentPost')
+                                        ORDER BY CreatedDate DESC ]){
+                                            List<Id> lstmems = new List<Id>();
+                                            if(mapCaseIdFeeds.containsKey(caseFeedRec.ParentId)){               
+                                                lstmems.add(caseFeedRec.ParentId);                                                      
+                                                mapCaseIdFeeds.get(caseFeedRec.ParentId).add(caseFeedRec);
+                                            }
+                                            else{                                                                     
+                                                mapCaseIdFeeds.put(caseFeedRec.ParentId, new List<FeedItem>{caseFeedRec});
+                                            }
+                                            
+                                        }
+            
+            for (Case caseRecord :lstOfqueriedCases){
+                integer count=0;
+                if(mapCaseIdFeeds.containskey(caseRecord.Id)){
+                    for(FeedItem caseFeedRec: mapCaseIdFeeds.get(caseRecord.Id)) {
+                        if(caseFeedRec.Type =='CaseCommentPost'){     
+                            system.debug('count : '+count);
+                            
+                            system.debug('caseCommnentsBodyMap.get(caseFeedRec.Id) '+ caseCommnentsBodyMap.get(caseRecord.Id).size());
+                            if(caseCommnentsBodyMap.containskey(caseRecord.Id)){
+                                feedWrapper.add(new WrapperChatterFeeds(caseFeedRec,caseFeedRec.FeedComments,caseCommnentsBodyMap.get(caseRecord.Id)[count]));
+                                count++;
+                            }
+                        }
+                        else{
+                            feedWrapper.add(new WrapperChatterFeeds(caseFeedRec,caseFeedRec.FeedComments,null));
+                        }
+                    }
+                }
+            } 
+        }
+    }
+    
+    public Set<Id> createAttachmentOnCase (List<Case> lstOfqueriedCases,Savepoint sp){
+         Set<Id> emailIdsSet = new Set<Id>();
+        Set<Id> caseIdsSet = new Set<Id>();
+        Set<Id> insertedContentId = new Set<Id>();
+        Map<Id,ContentDocument> mapContentIdName = new Map<Id,ContentDocument>();
+        List<EmailMessage> lstEmailMessages = new List<EmailMessage>();
+        for(EmailMessage emailMessageRec : [SELECT Id,ParentId,Messagedate FROM EmailMessage WHERE ParentId IN : lstOfqueriedCases ORDER BY MessageDate ASC]){
+            emailIdsSet.add(emailMessageRec.Id);
+            lstEmailMessages.add(emailMessageRec);
+            caseIdsSet.add(emailMessageRec.ParentId);
+        } 
+        system.debug('lstOfqueriedCases '+ lstOfqueriedCases);
+        //get the contentDocument for case before archieving
+        Map<Id,List<Id>> mapConIdCaseId = new Map<Id,List<Id>>();
+        if(caseIdsSet.size() > 0){
+        
+         for(ContentDocumentLink  conDocRec:  [SELECT ContentDocumentId,Id,ContentDocument.Title,LinkedEntityId FROM ContentDocumentLink WHERE LinkedEntityId IN: caseIdsSet]){
+                List<Id> lstmems = new List<Id>();
+                if(mapConIdCaseId.containsKey(conDocRec.LinkedEntityId)){               
+                    lstmems.add(conDocRec.LinkedEntityId);                                                      
+                    mapConIdCaseId.get(conDocRec.LinkedEntityId).add(conDocRec.ContentDocumentId);
+                }
+                else{                                                                     
+                    mapConIdCaseId.put(conDocRec.LinkedEntityId, new List<Id>{conDocRec.ContentDocumentId});
+                }
+            }
+        }
+        Map<Id,List<Id>> mapConIdEmailId = new Map<Id,List<Id>>();
+        if(emailIdsSet.size() > 0){
+            for(ContentDocumentLink  conDocRec:  [SELECT ContentDocumentId,Id,ContentDocument.Title,LinkedEntityId FROM ContentDocumentLink WHERE LinkedEntityId IN: emailIdsSet]){
+                List<Id> lstmems = new List<Id>();
+                if(mapConIdEmailId.containsKey(conDocRec.LinkedEntityId)){               
+                    lstmems.add(conDocRec.LinkedEntityId);                                                      
+                    mapConIdEmailId.get(conDocRec.LinkedEntityId).add(conDocRec.ContentDocumentId);
+                }
+                else{                                                                     
+                    mapConIdEmailId.put(conDocRec.LinkedEntityId, new List<Id>{conDocRec.ContentDocumentId});
+                }
+            }
+            List<Id> lstId = new List<Id>();
+            for(List<Id> ContentDocId: mapConIdEmailId.values()){
+                lstId.addall(ContentDocId);
+            }
+            for(ContentDocument documents: [Select Title, FileType,CreatedDate, ContentSize,Id,FileExtension from ContentDocument where Id IN: lstId]){
+                mapContentIdName.put(documents.Id,documents);
+            }
+            //Create ContentDocumentLink
+            //List<ContentDocumentLink> lstToInsertContentDocLink =new List<ContentDocumentLink>();
+            Map<Id,ContentDocumentLink> mapcontentDocIdContDoc = new Map<Id,ContentDocumentLink>();
+            Map<Id,ContentDocument> mapContentDocumentToUpdate =  new Map<Id,ContentDocument>();
+            
+            for (EmailMessage email: lstEmailMessages){
+                
+                if(mapConIdEmailId.containskey(email.Id)){
+                    for(Id contentDocID : mapConIdEmailId.get(email.Id) ){
+                        Boolean boolIsAttachWithCase = false;
+                        if(mapConIdCaseId.containskey(email.ParentId)){
+                            for(Id caseContentDocID : mapConIdCaseId.get(email.ParentId) ){
+                                if(caseContentDocID == contentDocID){
+                                    boolIsAttachWithCase =true;
+                                    break;
+                                }
+                            }
+                        }
+                        if(!boolIsAttachWithCase){
+                            ContentDocumentLink contentDocLink = New ContentDocumentLink();        
+                            contentDocLink.LinkedEntityId =  email.ParentId;        
+                            contentDocLink.ContentDocumentId = contentDocID;        
+                            contentDocLink.shareType = 'V';        
+                            // lstToInsertContentDocLink.add(contentDocLink); 
+                            if(!mapcontentDocIdContDoc.containskey(contentDocID)){
+                                mapcontentDocIdContDoc.put(contentDocID,contentDocLink);
+                            }
+                        }
+                        ContentDocument docs =new ContentDocument();
+                        docs.Id = contentDocID;
+                        system.debug('email.MessageDate '+ email.MessageDate);                        
+                        docs.Title = email.MessageDate.format('MM/dd/yyyy hh:mm a', 'HST')+'_'+mapContentIdName.get(contentDocID).Title;
+                        if(!mapContentDocumentToUpdate.containsKey(docs.id))
+                            mapContentDocumentToUpdate.put(docs.Id,docs);
+                    }
+                }
+            }
+            if(mapContentDocumentToUpdate.Values().size() > 0){
+                system.debug('lstContentDocumentToUpdate '+ mapContentDocumentToUpdate);
+                
+                Database.SaveResult[] drListContDocu = Database.update(mapContentDocumentToUpdate.values(), false);
+                List<String> appDebugLogList = new List<String>();   
+                for (Integer i = 0; i < drListContDocu.size(); i++){
+                    String failedError ='' ;
+                    if(drListContDocu.get(i).isSuccess()){
+                        //insertedContentId.add(drListContDocu.get(i).getId());
+                        System.debug('Successfully updated ContentDocument title: ' + drListContDocu.get(i).getId());
+                    }
+                    else  if(!drListContDocu.get(i).isSuccess()){
+                        for(Database.Error err : drListContDocu.get(i).getErrors()) {                                              
+                            System.debug(err.getStatusCode() + ': ' + err.getMessage());
+                            failedError +=' '+ err.getMessage();                                               
+                        }
+                        appDebugLogList.add('Error updated ContentDocument title: '+failedError);
+                        errMsgMap.put(mapContentDocumentToUpdate.values().get(i).Id, failedError);
+                        database.rollback(sp);
+                    }
+                } 
+            }
+            if(mapcontentDocIdContDoc.values().size() > 0){
+                Database.SaveResult[] drListContDocu = Database.insert(mapcontentDocIdContDoc.values(), false);
+                List<String> appDebugLogList = new List<String>();   
+                for (Integer i = 0; i < drListContDocu.size(); i++){
+                    String failedError ='' ;
+                    if(drListContDocu.get(i).isSuccess()){
+                        insertedContentId.add(drListContDocu.get(i).getId());
+                        System.debug('Successfully Inserted ContentDocumentLink/attachment with ID: ' + drListContDocu.get(i).getId());
+                    }
+                    else  if(!drListContDocu.get(i).isSuccess()){
+                        for(Database.Error err : drListContDocu.get(i).getErrors()) {                                              
+                            System.debug(err.getStatusCode() + ': ' + err.getMessage());
+                            failedError +=' '+ err.getMessage();                                               
+                        }
+                        appDebugLogList.add('Error Inserted ContentDocumentLink/attchment : '+failedError);
+                        errMsgMap.put(mapcontentDocIdContDoc.values().get(i).LinkedEntityId, failedError);
+                        database.rollback(sp);
+                    }
+                } 
+            }
+        }
+        return insertedContentId;
+    }
+    
+    
+    public Set<Id> updateCase(Set<Id> contentDocIds,Savepoint sp){
+        List<Id> insertedContDocId = new List<Id>(contentDocIds);
+        Set<Id> setCaseToUpdate = new Set<Id>();
+        Set<Id> setCaseUpdatedSuccess = new Set<Id>();
+        if(insertedContDocId.size() > 0){
+        for(ContentDocumentLink  conDocRec :  [SELECT ContentDocumentId,Id,ContentDocument.Title,LinkedEntityId FROM ContentDocumentLink WHERE Id IN: insertedContDocId]){
+            setCaseToUpdate.add(conDocRec.LinkedEntityId);
+        }
+        }
+        List<Case> lstCasetoUpdate = new List<Case>();
+        for(Id caseId :setCaseToUpdate){
+            Case caseRecord = new Case();
+            caseRecord.Id = caseId;
+            caseRecord.Archived__c = true;
+            lstCasetoUpdate.add(caseRecord);
+        }
+        if(lstCasetoUpdate.size() > 0){
+            Database.SaveResult[] drListCase = Database.Update(lstCasetoUpdate, false);
+            List<String> appDebugLogList = new List<String>();            
+            
+            for (Integer i = 0; i < drListCase.size(); i++){
+                String failedError = '' ;
+                if(drListCase.get(i).isSuccess()){
+                    setCaseUpdatedSuccess.add(drListCase.get(i).getId());
+                    System.debug('Successfully Updated the case : ' + drListCase.get(i).getId());
+                }
+                else  if(!drListCase.get(i).isSuccess()){
+                    for(Database.Error err : drListCase.get(i).getErrors()) {                                              
+                        System.debug(err.getStatusCode() + ': ' + err.getMessage());
+                        failedError+=' '+ err.getMessage();                                               
+                    }
+                    appDebugLogList.add('Error Message while updating case:'+failedError);
+                    errMsgMap.put(lstCasetoUpdate.get(i).Id, failedError);
+                    database.rollback(sp);
+                }
+            }            
+        }
+        return setCaseUpdatedSuccess;
+    }
+    
+    public Map<Id,Case> checkPDFGeneratedForCases(Set<Id> lstCaseUpdated){
+        Boolean pdfGenerated = false;
+        Map<Id,Case> mapIdCases = new Map<Id,Case>();
+        Map<Id,List<ContentDocumentLink>> mapContentDocId = new Map<Id,List<ContentDocumentLink>>();
+        for(ContentDocumentLink documentLink :[SELECT ContentDocumentId,Id,ContentDocument.Title,LinkedEntityId,ContentDocument.ContentSize, ContentDocument.FileExtension, ContentDocument.FileType 
+                                               FROM ContentDocumentLink WHERE LinkedEntityId IN : lstCaseUpdated AND ContentDocument.Title LIKE '%Email Messages Archive.pdf%'
+                                               // AND  ContentDocument.ContentSize > 1000 OR Test.isRunningTest()
+                                               AND ContentDocument.FileExtension = 'pdf']){
+                                                   List<Id> lstmems = new List<Id>();
+                                                   if(mapContentDocId.containsKey(documentLink.LinkedEntityId)){               
+                                                       lstmems.add(documentLink.LinkedEntityId);                                                      
+                                                       mapContentDocId.get(documentLink.LinkedEntityId).add(documentLink);
+                                                   }
+                                                   else{                                                                     
+                                                       mapContentDocId.put(documentLink.LinkedEntityId, new List<ContentDocumentLink>{documentLink});
+                                                   }        
+                                               }
+        for(Case caseRecord : [SELECT Id,Archived__c FROM Case WHERE Id IN: lstCaseUpdated]){
+            if(mapContentDocId.containsKey(caseRecord.Id) && mapContentDocId.get(caseRecord.Id).size() > 0 && caseRecord.Archived__c){                
+                mapIdCases.put(caseRecord.Id,caseRecord);     
+            }
+        }          
+        return mapIdCases;
+    }    
+    
+    public void deleteEmailMessage(List<Case> lstOfqueriedCases,Savepoint sp){
+        List<EmailMessage> EmailMessagesRecs= [SELECT ParentId,FromName,FromAddress,MessageDate,ToAddress,Subject,HasAttachment
+                                               FROM EmailMessage WHERE RelatedToId IN:lstOfqueriedCases  FOR UPDATE ] ;
+        Database.DeleteResult[] drList = Database.delete(EmailMessagesRecs, false);
+        List<String> appDebugLogList = new List<String>();                
+        
+        for (Integer i = 0; i < drList.size(); i++){
+            String failedError ='' ;
+            if(drList.get(i).isSuccess()){
+                System.debug('Successfully deleted EmailMessage with ID: ' + drList.get(i).getId());
+            }
+            else  if(!drList.get(i).isSuccess()){
+                for(Database.Error err : drList.get(i).getErrors()) {                                              
+                    System.debug(err.getStatusCode() + ': ' + err.getMessage());
+                    failedError=failedError+' '+ err.getMessage();                                               
+                }
+                appDebugLogList.add('Error Message while deleting emailmessage : '+failedError);
+                errMsgMap.put(EmailMessagesRecs.get(i).ParentId, failedError);
+                database.rollback(sp);
+            }
+        }  
+        
+    }
+    
+    public Set<Id> createCaseComments(Set<Id> setCaseIds,Set<Id> insertedPDFId,Savepoint sp,List<Id> insertedContentVersionId){       
+        Set<Id> setCaseToUpdate = new Set<Id>();
+        Set<Id> setCaseUpdatedSuccess = new Set<Id>();   
+        Map<Id,ContentDistribution> mapContDOcIdDocLink = new Map<Id,ContentDistribution>();
+        Map<Id,String> mapCaseIdDocId = new Map<Id,String>();
+        //Get Content Documents
+        Map<Id,ContentVersion> mapContVerContDoc = new Map<Id,ContentVersion>();
+        
+        for(ContentVersion conVerId : [SELECT Id,ContentDocumentId,ContentDocument.Title FROM ContentVersion WHERE Id IN :insertedContentVersionId]){
+            mapContVerContDoc.put(conVerId.ContentDocumentId, conVerId);
+        }
+        
+        for(ContentDocumentLink  conDocRec :  [SELECT ContentDocumentId,Id,ContentDocument.Title,LinkedEntityId FROM ContentDocumentLink WHERE Id IN: insertedPDFId]){
+            mapCaseIdDocId.put(conDocRec.LinkedEntityId,conDocRec.ContentDocumentId);
+        }
+        
+        List<FeedItem> lstCasetoUpdate = new List<FeedItem>();
+        for(Id caseId :setCaseIds){
+            FeedItem post = new FeedItem();
+            post.ParentId = caseId; 
+            post.Body = 'The case was archived with the PDF attachment.';
+            if(mapCaseIdDocId.containsKey(caseId) && mapContVerContDoc.containsKey(mapCaseIdDocId.get(caseId)))
+                post.RelatedRecordId = mapContVerContDoc.get(mapCaseIdDocId.get(caseId)).Id; 
+            post.Type = 'ContentPost';
+            lstCasetoUpdate.add(post);
+        }
+        if(lstCasetoUpdate.size() > 0){
+            Database.SaveResult[] drListCase = Database.Insert(lstCasetoUpdate, false);
+            List<String> appDebugLogList = new List<String>();            
+            
+            for (Integer i = 0; i < drListCase.size(); i++){
+                String failedError = '' ;
+                if(drListCase.get(i).isSuccess()){
+                    setCaseUpdatedSuccess.add(drListCase.get(i).getId());
+                    System.debug('Successfully Updated the case : ' + drListCase.get(i).getId());
+                }
+                else  if(!drListCase.get(i).isSuccess()){
+                    for(Database.Error err : drListCase.get(i).getErrors()) {                                              
+                        System.debug(err.getStatusCode() + ': ' + err.getMessage());
+                        failedError+=' '+ err.getMessage();                                               
+                    }
+                    appDebugLogList.add('Error Message while inserting case comments:'+failedError);
+                    errMsgMap.put(lstCasetoUpdate.get(i).Id, failedError);
+                    database.rollback(sp);
+                }
+            }            
+        }
+        return setCaseUpdatedSuccess;
+    }
+    
+    
+    global void execute(SchedulableContext ctx) {
+        EmailMessageArchiveBatch_AC archieveEmail = new EmailMessageArchiveBatch_AC();
+        Database.executebatch(archieveEmail,1);
+    }
+}
